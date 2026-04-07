@@ -11,12 +11,18 @@
     "LightmapTextureManagerMixin",
     "MouseMixin",
     "SectionBuilderMixin",
+    "veil.FramebufferStackMixin",
     "WorldRendererMixin",
     "WorldRendererSkyCloudOverrideMixin",
     "EntityObbCollisionMixin",
+    "LivingEntityObbGroundMixin",
+    "LivingEntityRendererPlayerAttachMixin",
     "MinecraftClientMixin",
     "accessor.CameraAccessor",
-    "accessor.GameRendererAccessor"
+    "accessor.EntityGroundAccessor",
+    "accessor.GameRendererAccessor",
+    "accessor.SoundManagerAccessor",
+    "accessor.SoundSystemAccessor"
   ],
   "injectors": {
     "defaultRequire": 1

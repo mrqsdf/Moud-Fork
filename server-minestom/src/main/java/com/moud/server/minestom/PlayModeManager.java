@@ -2,6 +2,7 @@ package com.moud.server.minestom;
 
 import com.moud.core.NodeTypeDef;
 import com.moud.core.scene.SceneTreeMutator;
+import com.moud.net.protocol.MultiMeshData;
 import com.moud.net.protocol.SceneList;
 import com.moud.net.protocol.SceneSnapshot;
 import com.moud.net.protocol.SchemaSnapshot;
@@ -11,6 +12,8 @@ import com.moud.net.transport.Lane;
 import com.moud.server.minestom.engine.SceneInstancer;
 import com.moud.server.minestom.engine.ServerScene;
 import com.moud.server.minestom.engine.ServerScenes;
+import com.moud.server.minestom.net.PlayerMessageSink;
+import com.moud.server.minestom.runtime.PlayerBodyManager;
 import com.moud.server.minestom.runtime.PlayRuntime;
 import com.moud.server.minestom.runtime.RuntimeRigidBodyReplicator;
 import com.moud.server.minestom.scripting.ScriptService;
@@ -20,9 +23,11 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.Collections;
 import net.minestom.server.MinecraftServer;
 import net.minestom.server.coordinate.Pos;
 import net.minestom.server.entity.Player;
@@ -34,9 +39,11 @@ final class PlayModeManager {
     private final SceneInstancer instancer;
     private final PlayRuntime playRuntime;
     private final RuntimeRigidBodyReplicator rigidBodyReplicator = new RuntimeRigidBodyReplicator();
+    private final PlayerBodyManager playerBodyManager;
     private final Map<String, SceneBaseline> baselineBySceneId = new HashMap<>();
 
     private volatile SchemaSnapshot cachedSchema;
+    private final Map<String, List<MultiMeshData>> pendingMultiMeshByScene = new HashMap<>();
 
     boolean isPausedForEditor(Map<UUID, PlayerState> playerStates) {
         if (playerStates == null || playerStates.isEmpty()) {
@@ -54,12 +61,15 @@ final class PlayModeManager {
                     ServerScene mainScene,
                     ScriptService scripts,
                     SceneInstancer instancer,
-                    PlayRuntime playRuntime) {
+                    PlayRuntime playRuntime,
+                    PlayerMessageSink playerMessageSink) {
         this.scenes = Objects.requireNonNull(scenes, "scenes");
         this.mainScene = Objects.requireNonNull(mainScene, "mainScene");
         this.scripts = Objects.requireNonNull(scripts, "scripts");
         this.instancer = Objects.requireNonNull(instancer, "instancer");
         this.playRuntime = Objects.requireNonNull(playRuntime, "playRuntime");
+        this.playerBodyManager = new PlayerBodyManager(
+                Objects.requireNonNull(playerMessageSink, "playerMessageSink"));
     }
 
     void onEditorModeChanged(Player player, PlayerState ps, Session session, boolean editorOpen) {
@@ -78,10 +88,14 @@ final class PlayModeManager {
             restoreBaseline(scene);
             if (session != null && session.state() == SessionState.CONNECTED) {
                 instancer.syncScene(scenes, scene);
-                session.send(Lane.STATE, scene.snapshot(0L));
+                SceneSnapshot snapshot = scene.snapshot(0L);
+                session.send(Lane.STATE, snapshot);
+                scripts.refreshEditorRuntime(scene);
+                sendLatestMultiMesh(session, snapshot, scene.sceneId());
             }
         } else if (wasOpen && !editorOpen) {
             captureBaseline(scene);
+            ps.multiMeshSent = false;
         }
     }
 
@@ -99,6 +113,7 @@ final class PlayModeManager {
             if (ns.nodeId() == rootId) {
                 continue;
             }
+
             LinkedHashMap<String, String> props = new LinkedHashMap<>();
             if (ns.properties() != null) {
                 for (SceneSnapshot.Property p : ns.properties()) {
@@ -150,11 +165,16 @@ final class PlayModeManager {
             return;
         }
 
+        pendingMultiMeshByScene.clear();
         for (ServerScene scene : scenes.allScenes()) {
             playRuntime.applyEditorWorldEnvironment(scene);
             String pendingTransition = scripts.tickRuntime(scene, dtSeconds);
             if (pendingTransition != null) {
                 applyScriptSceneTransition(scene.sceneId(), pendingTransition, playerStates);
+            }
+            List<MultiMeshData> mmData = scripts.drainMultiMesh(scene.sceneId());
+            if (!mmData.isEmpty()) {
+                pendingMultiMeshByScene.put(scene.sceneId(), mmData);
             }
         }
     }
@@ -195,6 +215,17 @@ final class PlayModeManager {
                 : null;
         playRuntime.tick(player.getUuid(), session, scene, playerCamId, followCam, scriptCam);
         rigidBodyReplicator.send(scene, session);
+        playerBodyManager.tick(player);
+        if (!ps.multiMeshSent) {
+            for (MultiMeshData mm : scripts.getLatestMultiMesh(scene.sceneId())) {
+                session.send(Lane.STATE, mm);
+            }
+            ps.multiMeshSent = true;
+        }
+        for (MultiMeshData msg : pendingMultiMeshByScene.getOrDefault(scene.sceneId(), Collections.emptyList())) {
+            session.send(Lane.STATE, msg);
+        }
+        session.send(Lane.STATE, scene.snapshot(0L));
     }
 
     void onPlayerSpawn(Player player, PlayerState ps, ServerScene spawnScene) {
@@ -202,14 +233,30 @@ final class PlayModeManager {
             return;
         }
         playRuntime.onPlayerSpawn(player, spawnScene);
+        playerBodyManager.onPlayerSpawn(player, spawnScene);
     }
+
 
     void onDisconnect(UUID uuid) {
         playRuntime.onDisconnect(uuid);
+        playerBodyManager.onPlayerLeave(uuid);
     }
 
     void onSceneChanged(UUID uuid, String sceneId) {
         playRuntime.onSceneChanged(uuid, sceneId);
+    }
+
+    void refreshEditorScene(Session session, ServerScene scene) {
+        if (session == null || scene == null) {
+            return;
+        }
+        if (session.state() != SessionState.CONNECTED) {
+            return;
+        }
+        scripts.refreshEditorRuntime(scene);
+        for (MultiMeshData mm : scripts.drainMultiMesh(scene.sceneId())) {
+            session.send(Lane.STATE, mm);
+        }
     }
 
     void requestRespawn(Player player, PlayerState ps) {
@@ -234,6 +281,9 @@ final class PlayModeManager {
         ps.activeSceneId = targetId;
         playRuntime.onSceneChanged(player.getUuid(), targetId);
 
+        // Tear down PlayerBody in the old scene and create one in the new scene.
+        playerBodyManager.onPlayerLeave(player.getUuid());
+
         Pos targetStartPos = PlayRuntime.findPlayerStartPos(target);
         Pos spawnPos = targetStartPos != null ? targetStartPos : new Pos(0, 64, 0);
         player.setInstance(target.instance(), spawnPos)
@@ -241,9 +291,13 @@ final class PlayModeManager {
                     if (session.state() != SessionState.CONNECTED) {
                         return;
                     }
+                    playerBodyManager.onPlayerSpawn(player, target);
                     session.send(Lane.STATE, new SceneList(scenes.snapshotInfo(), targetId));
                     instancer.syncScene(scenes, target);
                     session.send(Lane.STATE, target.snapshot(0L));
+                    for (MultiMeshData mm : scripts.getLatestMultiMesh(targetId)) {
+                        session.send(Lane.STATE, mm);
+                    }
                 }).schedule())
                 .exceptionally(ex -> {
                     DebugLog.error("scene", "failed to switch to '" + targetId + "': " + ex.getMessage());
@@ -300,6 +354,27 @@ final class PlayModeManager {
             ps.activeSceneId = active;
         }
         session.send(Lane.STATE, new SceneList(scenes.snapshotInfo(), active));
+    }
+
+    private void sendLatestMultiMesh(Session session, SceneSnapshot snapshot, String sceneId) {
+        if (session == null || snapshot == null || sceneId == null || sceneId.isBlank()) {
+            return;
+        }
+        List<MultiMeshData> latest = scripts.getLatestMultiMesh(sceneId);
+        if (latest == null || latest.isEmpty() || snapshot.nodes() == null || snapshot.nodes().isEmpty()) {
+            return;
+        }
+        HashSet<Long> nodeIds = new HashSet<>(Math.max(16, snapshot.nodes().size() * 2));
+        for (SceneSnapshot.NodeSnapshot ns : snapshot.nodes()) {
+            if (ns != null && ns.nodeId() > 0L) {
+                nodeIds.add(ns.nodeId());
+            }
+        }
+        for (MultiMeshData mm : latest) {
+            if (mm != null && nodeIds.contains(mm.nodeId())) {
+                session.send(Lane.STATE, mm);
+            }
+        }
     }
 
     private SchemaSnapshot schemaSnapshot() {

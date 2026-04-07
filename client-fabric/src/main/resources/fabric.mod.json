@@ -9,6 +9,7 @@
   "license": "All-Rights-Reserved",
   "environment": "client",
   "entrypoints": {
+    "preLaunch": ["com.moud.client.fabric.bootstrap.ClientBootstrap"],
     "client": ["com.moud.client.fabric.FabricClientEntrypoint"]
   },
   "mixins": [
@@ -16,7 +17,7 @@
   ],
   "depends": {
     "minecraft": "1.21.1",
-    "fabricloader": ">=0.17.2",
+    "fabricloader": ">=0.18.6",
     "fabric-api": "*"
   }
 }

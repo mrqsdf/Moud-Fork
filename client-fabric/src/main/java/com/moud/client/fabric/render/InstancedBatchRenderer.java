@@ -2,6 +2,7 @@ package com.moud.client.fabric.render;
 
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.moud.client.fabric.render.mesh.MoudMeshBuffer;
+import com.moud.client.fabric.render.MoudTextures;
 import com.moud.client.fabric.render.veil.GlUtil;
 import com.moud.client.fabric.render.veil.VeilDynamicShaders;
 import com.moud.net.protocol.SceneSnapshot;
@@ -17,6 +18,7 @@ import net.minecraft.client.render.Camera;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.Vec3d;
 import org.joml.Matrix4f;
+import org.joml.Matrix4fc;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL20C;
@@ -25,12 +27,16 @@ import org.lwjgl.system.MemoryUtil;
 import java.io.InputStream;
 import java.nio.FloatBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 
 final class InstancedBatchRenderer {
 
-    private static final int FLOATS_PER_INSTANCE = 36;
+    private static final int FLOATS_PER_INSTANCE = 20;
     private static final int INITIAL_CAPACITY    = 64;
 
     private final String instancedVert;
@@ -39,7 +45,7 @@ final class InstancedBatchRenderer {
     private int instanceVbo;
     private int instanceVboCapacity;
     private FloatBuffer instanceBuffer;
-    private final Map<Long, Integer> vaoCache = new HashMap<>();
+    private final Map<Long, Integer> vaoCache = new ConcurrentHashMap<>();
     private final SceneLights sceneLights;
 
     InstancedBatchRenderer(SceneLights sceneLights) {
@@ -50,7 +56,9 @@ final class InstancedBatchRenderer {
 
     int renderBatched(List<SceneSnapshot.NodeSnapshot> nodes,
                       Function<Long, VeilSceneNodeRenderer.Pose> poseResolver,
-                      Vec3d camPos, Camera camera, MinecraftClient client, float tickDelta) {
+                      Vec3d camPos, Camera camera, Matrix4fc viewMatrix, Matrix4fc projectionMatrix,
+                      MinecraftClient client, float tickDelta) {
+        if (!RenderSystem.isOnRenderThread()) return 0;
 
         ShaderProgram program = getOrCompileProgram();
         if (program == null || !program.isValid()) return 0;
@@ -60,16 +68,12 @@ final class InstancedBatchRenderer {
         Map<String, List<NodeInstance>> batches = buildBatches(nodes, poseResolver, camPos);
         if (batches.isEmpty()) return 0;
 
-        Matrix4f viewMat, projMat;
         ShaderBlock<CameraMatrices> camBlock = VeilRenderSystem.getBlock(VeilShaderBufferRegistry.CAMERA.get());
         CameraMatrices veilCam = camBlock != null ? camBlock.getValue() : null;
-        if (veilCam != null) {
-            viewMat = new Matrix4f(veilCam.getViewMatrix());
-            projMat = new Matrix4f(veilCam.getProjectionMatrix());
-        } else {
-            viewMat = new Matrix4f();
-            projMat = new Matrix4f(RenderSystem.getProjectionMatrix());
-        }
+        Matrix4f viewMat = veilCam != null ? new Matrix4f(veilCam.getViewMatrix())
+                : (viewMatrix != null ? new Matrix4f(viewMatrix) : new Matrix4f());
+        Matrix4f projMat = veilCam != null ? new Matrix4f(veilCam.getProjectionMatrix())
+                : (projectionMatrix != null ? new Matrix4f(projectionMatrix) : new Matrix4f(RenderSystem.getProjectionMatrix()));
 
         RenderSystem.enableDepthTest();
         RenderSystem.depthMask(true);
@@ -91,7 +95,11 @@ final class InstancedBatchRenderer {
                 List<NodeInstance> instances = entry.getValue();
                 if (instances.isEmpty()) continue;
 
-                var mesh = resolveMesh(entry.getKey());
+                String batchKey = entry.getKey();
+                boolean doubleSided = batchKey.endsWith(":ds");
+                String meshKey = doubleSided ? batchKey.substring(0, batchKey.length() - 3) : batchKey;
+
+                var mesh = resolveMesh(meshKey);
                 ensureInstanceVbo(instances.size());
                 fillInstanceData(instances);
                 uploadInstanceData();
@@ -100,7 +108,9 @@ final class InstancedBatchRenderer {
                 int vao = vaoCache.computeIfAbsent(key,
                         k -> GlUtil.createInstancedMeshVao(pid, mesh.vbo, mesh.ebo, instanceVbo));
 
+                if (doubleSided) RenderSystem.disableCull();
                 GlUtil.drawElementsInstanced(vao, mesh.indexCount, instances.size());
+                if (doubleSided) RenderSystem.enableCull();
                 rendered += instances.size();
             }
         } finally {
@@ -123,6 +133,12 @@ final class InstancedBatchRenderer {
             String materialPath = VeilSceneNodeRenderer.stringProp(node, "material");
             if (materialPath != null && !materialPath.isBlank()) continue;
 
+            String texProp = VeilSceneNodeRenderer.stringProp(node, "texture");
+            boolean hasCustomTexture = texProp != null && !texProp.isBlank()
+                    && !MoudTextures.WHITE_ID.toString().equals(texProp)
+                    && !"moud:dynamic/white".equals(texProp);
+            if (hasCustomTexture) continue;
+
             VeilSceneNodeRenderer.Pose world = poseResolver.apply(node.nodeId());
             if (world == null) continue;
 
@@ -134,8 +150,12 @@ final class InstancedBatchRenderer {
             String mesh = VeilSceneNodeRenderer.stringProp(node, "mesh");
             if (mesh == null || mesh.isBlank()) mesh = "cube";
 
-            batches.computeIfAbsent(mesh, k -> new ArrayList<>())
-                    .add(new NodeInstance(world, camPos, tintR, tintG, tintB, opacity));
+            boolean doubleSided = VeilSceneNodeRenderer.parseBool(
+                    VeilSceneNodeRenderer.stringProp(node, "double_sided"), false);
+            String batchKey = doubleSided ? mesh + ":ds" : mesh;
+
+            batches.computeIfAbsent(batchKey, k -> new ArrayList<>())
+                    .add(new NodeInstance(world, tintR, tintG, tintB, opacity));
         }
         return batches;
     }
@@ -187,8 +207,6 @@ final class InstancedBatchRenderer {
     private void fillInstanceData(List<NodeInstance> instances) {
         instanceBuffer.clear();
         for (var inst : instances) {
-            inst.modelMat.get(instanceBuffer);
-            instanceBuffer.position(instanceBuffer.position() + 16);
             inst.worldMat.get(instanceBuffer);
             instanceBuffer.position(instanceBuffer.position() + 16);
             instanceBuffer.put(inst.tintR).put(inst.tintG).put(inst.tintB).put(inst.opacity);
@@ -234,18 +252,11 @@ final class InstancedBatchRenderer {
         return "";
     }
 
-    private record NodeInstance(Matrix4f modelMat, Matrix4f worldMat,
+    private record NodeInstance(Matrix4f worldMat,
                                 float tintR, float tintG, float tintB, float opacity) {
-        NodeInstance(VeilSceneNodeRenderer.Pose world, Vec3d camPos,
+        NodeInstance(VeilSceneNodeRenderer.Pose world,
                      float tintR, float tintG, float tintB, float opacity) {
             this(
-                    new Matrix4f()
-                            .translate((float)(world.pos.x - camPos.x),
-                                    (float)(world.pos.y - camPos.y),
-                                    (float)(world.pos.z - camPos.z))
-                            .rotate(world.rot)
-                            .scale(world.scale.x, world.scale.y, world.scale.z)
-                            .translate(-0.5f, -0.5f, -0.5f),
                     new Matrix4f()
                             .translate(world.pos.x, world.pos.y, world.pos.z)
                             .rotate(world.rot)

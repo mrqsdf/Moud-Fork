@@ -28,6 +28,10 @@ public final class EditorState {
     public List<SceneInfo> scenes = List.of(new SceneInfo("main", "Main"));
     public String activeSceneId = "main";
     public final ArrayList<String> openSceneIds = new ArrayList<>(List.of("main"));
+    public final ArrayList<String> openScriptPaths = new ArrayList<>();
+    public String activeScriptPath = "";
+    public final ArrayList<String> openTextAssetPaths = new ArrayList<>();
+    public String activeTextAssetPath = "";
     public long selectedId;
     public final LinkedHashSet<Long> selectedIds = new LinkedHashSet<>();
     public long nextSnapshotRequestId = 1;
@@ -43,6 +47,9 @@ public final class EditorState {
     public String projectAuthor = "";
 
     public final ArrayList<AssetManifestResponse.Entry> manifestEntries = new ArrayList<>();
+
+    public final HashMap<String, double[]> sceneCameraStates = new HashMap<>();
+    public final HashMap<String, double[]> sceneCanvasStates = new HashMap<>();
 
     public final Map<Long, ScriptActions> scriptActionsByNode = new HashMap<>();
 
@@ -183,6 +190,42 @@ public final class EditorState {
         }
         if (!openSceneIds.contains(sceneId)) {
             openSceneIds.add(sceneId);
+        }
+    }
+
+    public void ensureScriptOpen(String path) {
+        if (path == null || path.isBlank()) {
+            return;
+        }
+        if (!openScriptPaths.contains(path)) {
+            openScriptPaths.add(path);
+        }
+        activeScriptPath = path;
+    }
+
+    public void closeScriptTab(String path) {
+        if (path == null) {
+            return;
+        }
+        openScriptPaths.remove(path);
+        if (path.equals(activeScriptPath)) {
+            activeScriptPath = openScriptPaths.isEmpty() ? "" : openScriptPaths.getLast();
+        }
+    }
+
+    public void ensureTextAssetOpen(String path) {
+        if (path == null || path.isBlank()) return;
+        if (!openTextAssetPaths.contains(path)) {
+            openTextAssetPaths.add(path);
+        }
+        activeTextAssetPath = path;
+    }
+
+    public void closeTextAssetTab(String path) {
+        if (path == null) return;
+        openTextAssetPaths.remove(path);
+        if (path.equals(activeTextAssetPath)) {
+            activeTextAssetPath = openTextAssetPaths.isEmpty() ? "" : openTextAssetPaths.getLast();
         }
     }
 

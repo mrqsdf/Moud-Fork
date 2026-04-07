@@ -2,6 +2,8 @@ package com.moud.client.fabric.mixin;
 
 import com.moud.client.fabric.editor.overlay.EditorContext;
 import com.moud.client.fabric.editor.overlay.EditorOverlayBus;
+import com.moud.client.fabric.runtime.PlayRuntimeBus;
+import com.moud.client.fabric.runtime.PlayRuntimeClient;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.Mouse;
 import net.minecraft.client.util.Window;
@@ -34,14 +36,19 @@ public abstract class MouseMixin {
     private void moud$onMouseButton(long window, int button, int action, int mods, CallbackInfo ci) {
         EditorContext ctx = EditorOverlayBus.get();
         if (ctx == null || !ctx.isActive()) {
-            return; // in play mode, let vanilla handle clicks
+            PlayRuntimeClient runtime = PlayRuntimeBus.get();
+            if (runtime == null || !runtime.isActive() || !runtime.isCursorModeEnabled() || client == null || client.currentScreen != null) {
+                return; // in play mode, let vanilla handle clicks unless cursor mode is active
+            }
+            ci.cancel();
+            return;
         }
         if (client == null || client.currentScreen != null) {
             return;
         }
 
         if (button == GLFW.GLFW_MOUSE_BUTTON_RIGHT) {
-            ctx.camera().consumeMouseButton(button, action, scaledMouseX(), scaledMouseY());
+            ctx.camera().consumeMouseButton(button, action, client.mouse.getX(), client.mouse.getY());
         }
         ci.cancel();
     }
@@ -73,6 +80,13 @@ public abstract class MouseMixin {
             return;
         }
         // dans le playmode on laisse la souris
+        PlayRuntimeClient runtime = PlayRuntimeBus.get();
+        if (runtime != null && runtime.isActive() && runtime.isCursorModeEnabled()) {
+            if (client == null || client.currentScreen != null) {
+                return;
+            }
+            ci.cancel();
+        }
     }
 
     @Inject(method = "onCursorPos", at = @At("HEAD"))
@@ -86,15 +100,4 @@ public abstract class MouseMixin {
         }
     }
 
-    private double scaledMouseX() {
-        Window window = client.getWindow();
-        int w = window.getScaledWidth();
-        return client.mouse.getX() * w / (double) Math.max(1, window.getWidth());
-    }
-
-    private double scaledMouseY() {
-        Window window = client.getWindow();
-        int h = window.getScaledHeight();
-        return client.mouse.getY() * h / (double) Math.max(1, window.getHeight());
-    }
 }

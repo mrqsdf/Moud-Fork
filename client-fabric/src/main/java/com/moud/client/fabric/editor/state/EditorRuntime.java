@@ -2,7 +2,6 @@ package com.moud.client.fabric.editor.state;
 
 
 import com.miry.graphics.Texture;
-import com.miry.ui.input.UiInput;
 import com.moud.client.fabric.assets.AssetsClient;
 import com.moud.client.fabric.editor.dialogs.CreateAssetDialog;
 import com.moud.client.fabric.editor.dialogs.CreateNodeDialog;
@@ -16,6 +15,7 @@ import com.moud.core.assets.ResPath;
 import com.moud.net.protocol.AssetManifestResponse;
 import com.moud.net.protocol.SceneList;
 import com.moud.net.protocol.SceneOpAck;
+import com.moud.net.protocol.SceneOp;
 import com.moud.net.protocol.SceneSnapshot;
 import com.moud.net.protocol.SchemaSnapshot;
 import com.moud.net.protocol.ScriptActionListResponse;
@@ -31,7 +31,12 @@ import java.util.Objects;
 import java.util.function.LongConsumer;
 
 public final class EditorRuntime {
-    private static final float SCENE_DRAG_THRESHOLD_PX = 6.0f;
+    private static final String PROP_SCENE_MODE = "scene_mode";
+
+    public enum ViewportMode {
+        THREE_D,
+        TWO_D
+    }
 
     public static final class ToastRequest {
         public final String message;
@@ -53,20 +58,19 @@ public final class EditorRuntime {
     private TextAssetEditorDialog textAssetEditorDialog;
     private QuickSearchDialog quickSearchDialog;
     private Runnable openCreateSceneAction;
+    private Runnable openEditorSettingsAction;
     private AssetsClient assets;
     private Session session;
     private Texture viewportTexture;
     private EditorTool tool = EditorTool.SELECT;
+    private ViewportMode viewportMode = ViewportMode.THREE_D;
     private boolean gridSnapEnabled;
     private float gridSnapStep = 1.0f;
     private boolean rotationSnapEnabled = true;
     private float rotationSnapDeg = 15.0f;
     private boolean gizmoLocalSpace;
     private boolean frameSelectedRequested;
-    private String assetDragPath;
-    private float assetDragStartX;
-    private float assetDragStartY;
-    private boolean assetDragActive;
+    private boolean frameSelected2DRequested;
     private float framebufferScaleX = 1.0f;
     private float framebufferScaleY = 1.0f;
     private int uiWidth;
@@ -75,16 +79,14 @@ public final class EditorRuntime {
     private boolean rightPressed;
     private boolean rightReleased;
     private boolean uiBlocked;
+    private float editorUiScale = 1.0f;
     private ToastRequest pendingToast;
     private final HashMap<Long, LongConsumer> afterCreateByBatchId = new HashMap<>();
     private final EditorHistory history = new EditorHistory();
 
     private Runnable overlayMenuRender;
 
-    private String sceneDragId;
-    private float sceneDragStartX;
-    private float sceneDragStartY;
-    private boolean sceneDragActive;
+    private final HashMap<String, ViewportMode> pendingSceneModes = new HashMap<>();
 
     public EditorRuntime(EditorState state, EditorNet net) {
         this.state = state;
@@ -121,6 +123,104 @@ public final class EditorRuntime {
 
     public void setTool(EditorTool tool) {
         this.tool = tool == null ? EditorTool.SELECT : tool;
+    }
+
+    public ViewportMode viewportMode() {
+        return viewportMode;
+    }
+
+    public void setViewportMode(ViewportMode mode) {
+        viewportMode = mode == null ? ViewportMode.THREE_D : mode;
+    }
+
+    public void markSceneMode(String sceneId, ViewportMode mode) {
+        if (sceneId == null || sceneId.isBlank()) {
+            return;
+        }
+        ViewportMode m = mode == null ? ViewportMode.THREE_D : mode;
+        if (m != ViewportMode.TWO_D) {
+            return;
+        }
+        pendingSceneModes.put(sceneId, m);
+    }
+
+    public void onSnapshot(SceneSnapshot snapshot) {
+        if (snapshot == null) {
+            return;
+        }
+        EditorState st = state;
+        if (st == null) {
+            return;
+        }
+        String sceneId = st.activeSceneId;
+        if (sceneId == null || sceneId.isBlank()) {
+            return;
+        }
+        ViewportMode pending = pendingSceneModes.remove(sceneId);
+        if (pending == null) {
+            return;
+        }
+        applySceneModeTemplate(sceneId, pending);
+    }
+
+    private void applySceneModeTemplate(String sceneId, ViewportMode mode) {
+        EditorState st = state;
+        Session sess = session;
+        if (st == null || sess == null || net == null || st.scene == null) {
+            return;
+        }
+
+        long rootId = findRootNodeId(st);
+        if (rootId <= 0L) {
+            st.pendingSnapshot = true;
+            return;
+        }
+
+        if (mode != ViewportMode.TWO_D) {
+            return;
+        }
+        String modeValue = "2d";
+        ArrayList<SceneOp> ops = new ArrayList<>();
+        ops.add(new SceneOp.SetProperty(rootId, PROP_SCENE_MODE, modeValue));
+
+        for (var node : st.scene.nodes()) {
+            if (node == null) {
+                continue;
+            }
+            if (node.parentId() != rootId) {
+                continue;
+            }
+            String type = node.type();
+            String name = node.name();
+            if ("WorldEnvironment".equals(type) || "WorldEnvironment".equals(name)
+                    || "Ticker".equals(type) || "ticker".equalsIgnoreCase(name)) {
+                ops.add(new SceneOp.QueueFree(node.nodeId()));
+            }
+        }
+        setViewportMode(ViewportMode.TWO_D);
+
+        net.sendOps(sess, st, ops);
+        st.pendingSnapshot = true;
+    }
+
+    private static long findRootNodeId(EditorState st) {
+        if (st == null || st.scene == null) {
+            return 0L;
+        }
+        var roots = st.scene.childrenOf(0L);
+        if (roots != null) {
+            for (var node : roots) {
+                if (node != null && "Root".equals(node.type())) {
+                    return node.nodeId();
+                }
+            }
+            for (var node : roots) {
+                if (node != null) {
+                    return node.nodeId();
+                }
+            }
+        }
+        return 0L;
     }
 
     public boolean gridSnapEnabled() {
@@ -166,26 +266,12 @@ public final class EditorRuntime {
         return v;
     }
 
-    public void beginAssetDrag(String path, float mouseX, float mouseY) {
-        if (path == null || path.isBlank()) return;
-        assetDragPath = path;
-        assetDragStartX = mouseX;
-        assetDragStartY = mouseY;
-        assetDragActive = false;
+    public void requestFrameSelected2D() { frameSelected2DRequested = true; }
+    public boolean consumeFrameSelected2DRequest() {
+        boolean v = frameSelected2DRequested;
+        frameSelected2DRequested = false;
+        return v;
     }
-
-    public void updateAssetDrag(UiInput input) {
-        if (assetDragPath == null || assetDragActive || input == null || !input.mouseDown()) return;
-        float dx = input.mousePos().x - assetDragStartX;
-        float dy = input.mousePos().y - assetDragStartY;
-        if (dx * dx + dy * dy >= SCENE_DRAG_THRESHOLD_PX * SCENE_DRAG_THRESHOLD_PX) {
-            assetDragActive = true;
-        }
-    }
-
-    public String assetDragPath() { return assetDragPath; }
-    public boolean assetDragActive() { return assetDragActive; }
-    public void clearAssetDrag() { assetDragPath = null; assetDragActive = false; }
 
     public void cycleRotationSnapDeg() {
         if (Math.abs(rotationSnapDeg - 15.0f) < 1e-3f) {
@@ -247,6 +333,17 @@ public final class EditorRuntime {
 
     public void setUiBlocked(boolean uiBlocked) {
         this.uiBlocked = uiBlocked;
+    }
+
+    public float editorUiScale() {
+        return editorUiScale;
+    }
+
+    public void setEditorUiScale(float scale) {
+        if (!Float.isFinite(scale)) {
+            return;
+        }
+        editorUiScale = Math.max(0.75f, Math.min(1.75f, scale));
     }
 
     public void requestToast(String message, boolean error, int durationMs) {
@@ -322,6 +419,9 @@ public final class EditorRuntime {
     }
 
     public void openScriptEditor(long nodeId, String scriptPath) {
+        if (scriptPath != null && !scriptPath.isBlank()) {
+            state.ensureScriptOpen(scriptPath);
+        }
         ScriptEditorDialog dialog = scriptEditorDialog;
         if (dialog == null) {
             return;
@@ -331,18 +431,24 @@ public final class EditorRuntime {
 
     public void openTextAssetEditor(String resPath, AssetHash hash) {
         TextAssetEditorDialog dialog = textAssetEditorDialog;
-        if (dialog == null) {
-            return;
-        }
+        if (dialog == null) return;
         dialog.open(resPath, hash);
+        EditorState st = state;
+        if (st != null) {
+            st.activeScriptPath = "";
+            st.ensureTextAssetOpen(resPath);
+        }
     }
 
     public void openTextAssetEditor(String resPath, AssetHash hash, String initialText) {
         TextAssetEditorDialog dialog = textAssetEditorDialog;
-        if (dialog == null) {
-            return;
-        }
+        if (dialog == null) return;
         dialog.open(resPath, hash, initialText);
+        EditorState st = state;
+        if (st != null) {
+            st.activeScriptPath = "";
+            st.ensureTextAssetOpen(resPath);
+        }
     }
 
     public void openCreateAsset() {
@@ -378,6 +484,17 @@ public final class EditorRuntime {
         }
     }
 
+    public void setOpenEditorSettingsAction(Runnable action) {
+        this.openEditorSettingsAction = action;
+    }
+
+    public void openEditorSettings() {
+        Runnable action = openEditorSettingsAction;
+        if (action != null) {
+            action.run();
+        }
+    }
+
     public AssetsClient assets() {
         return assets;
     }
@@ -407,42 +524,5 @@ public final class EditorRuntime {
         Runnable r = this.overlayMenuRender;
         this.overlayMenuRender = null;
         return r;
-    }
-
-    public void beginSceneDrag(String sceneId, float mouseX, float mouseY) {
-        if (sceneId == null || sceneId.isBlank()) {
-            return;
-        }
-        sceneDragId = sceneId;
-        sceneDragStartX = mouseX;
-        sceneDragStartY = mouseY;
-        sceneDragActive = false;
-    }
-
-    public void updateSceneDrag(UiInput input) {
-        if (sceneDragId == null || sceneDragActive || input == null || !input.mouseDown()) {
-            return;
-        }
-        float mx = input.mousePos().x;
-        float my = input.mousePos().y;
-        float dx = mx - sceneDragStartX;
-        float dy = my - sceneDragStartY;
-        float threshold = SCENE_DRAG_THRESHOLD_PX;
-        if (dx * dx + dy * dy >= threshold * threshold) {
-            sceneDragActive = true;
-        }
-    }
-
-    public String sceneDragId() {
-        return sceneDragId;
-    }
-
-    public boolean sceneDragActive() {
-        return sceneDragActive;
-    }
-
-    public void clearSceneDrag() {
-        sceneDragId = null;
-        sceneDragActive = false;
     }
 }

@@ -1,6 +1,8 @@
 package com.moud.client.fabric;
 
+import com.moud.client.fabric.audio.SceneAudioManager;
 import com.moud.client.fabric.assets.AssetsClient;
+import com.moud.client.fabric.assets.MoudAudioAssets;
 import com.moud.client.fabric.assets.MoudTextAssets;
 import com.moud.client.fabric.editor.overlay.EditorContext;
 import com.moud.client.fabric.editor.overlay.EditorOverlay;
@@ -8,14 +10,20 @@ import com.moud.client.fabric.editor.overlay.EditorOverlayBus;
 import com.moud.client.fabric.editor.state.EditorRuntime;
 import com.moud.client.fabric.editor.util.AssetImportUtil;
 import com.moud.client.fabric.net.ClientSessionBus;
+import com.moud.client.fabric.player.ClientPlayerMotionController;
+import com.moud.client.fabric.player.MoudPalAnimLayer;
+import com.moud.client.fabric.player.PlayerBodyAttachmentCache;
 import com.moud.client.fabric.net.EnginePayload;
 import com.moud.client.fabric.net.FabricEngineTransport;
 import com.moud.client.fabric.platform.MinecraftFreeflyCamera;
 import com.moud.client.fabric.platform.MinecraftGhostBlocks;
 import com.moud.client.fabric.model.ModelCache;
+import com.moud.client.fabric.render.InstanceDataStore;
 import com.moud.client.fabric.render.MoudIcons;
 import com.moud.client.fabric.render.MoudTextures;
 import com.moud.client.fabric.render.VeilSceneNodeRenderer;
+import com.moud.client.fabric.render.hud.HudCanvasRenderer;
+import com.moud.client.fabric.render.hud.UiInputTracker;
 import com.moud.client.fabric.render.env.VeilWorldEnvironmentRenderer;
 import com.moud.client.fabric.runtime.PlayRuntimeBus;
 import com.moud.client.fabric.runtime.PlayRuntimeClient;
@@ -26,6 +34,7 @@ import com.moud.net.protocol.ProjectCreateAck;
 import com.moud.net.protocol.ProjectInfo;
 import com.moud.net.protocol.RequestRespawn;
 import com.moud.net.protocol.RuntimeState;
+import com.moud.net.protocol.CursorState;
 import com.moud.net.protocol.SceneOp;
 import com.moud.net.protocol.SceneCreateAck;
 import com.moud.net.protocol.SceneDeleteAck;
@@ -40,6 +49,8 @@ import com.moud.net.protocol.SchemaSnapshot;
 import com.moud.net.protocol.ScriptActionInvokeAck;
 import com.moud.net.protocol.ScriptActionListResponse;
 import com.moud.net.protocol.ScriptFileReadResponse;
+import com.moud.net.protocol.MultiMeshData;
+import com.moud.net.protocol.PlayerMotion;
 import com.moud.net.protocol.ScriptFileWriteAck;
 import com.moud.net.protocol.ServerHello;
 import com.moud.net.session.Session;
@@ -56,6 +67,7 @@ import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.option.GameOptions;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.text.Text;
@@ -67,6 +79,8 @@ final class MoudClient {
     private final EditorContext editorContext = new EditorContext(camera);
     private final AssetsClient assets = new AssetsClient();
     private final PlayRuntimeClient playRuntime = new PlayRuntimeClient();
+    private final UiInputTracker uiInputTracker = new UiInputTracker();
+    private final SceneAudioManager sceneAudio = new SceneAudioManager();
 
     private FabricEngineTransport transport;
     private Session session;
@@ -75,6 +89,7 @@ final class MoudClient {
     private boolean overlayOpen;
     private Boolean lastEditorModeSent;
     private boolean pendingOverlayDispose;
+    private boolean pendingRestoreSnapshot;
     private boolean autoOpenedEditor;
     private KeyBinding toggleKey;
     private boolean dropCallbackRegistered;
@@ -121,7 +136,7 @@ final class MoudClient {
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> client.execute(this::onJoin));
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> client.execute(this::onDisconnect));
         ClientTickEvents.END_CLIENT_TICK.register(this::tick);
-        HudRenderCallback.EVENT.register((drawContext, tickDelta) -> renderOverlays());
+        HudRenderCallback.EVENT.register((drawContext, tickDelta) -> renderOverlays(drawContext));
     }
 
     private void initializeSubsystems() {
@@ -129,8 +144,10 @@ final class MoudClient {
         PlayRuntimeBus.set(playRuntime);
         VeilSceneNodeRenderer.init();
         VeilWorldEnvironmentRenderer.init();
+        MoudPalAnimLayer.register();
         MoudTextures.init(assets);
         MoudTextAssets.init(assets);
+        MoudAudioAssets.init(assets);
         ModelCache.init(assets);
     }
 
@@ -169,7 +186,7 @@ final class MoudClient {
 
     private static void initIcons() {
         String[] nodeTypes = {
-                "Camera3D", "PlayerStart", "WorldEnvironment",
+                "Camera3D", "PlayerStart", "PlayerAttachment", "WorldEnvironment",
                 "CSGBox", "CSGBlock", "MeshInstance3D", "SceneInstance3D",
                 "OmniLight3D", "DirectionalLight3D", "SpotLight3D",
                 "Node3D", "Model3D",
@@ -215,18 +232,22 @@ final class MoudClient {
         autoOpenedEditor = false;
 
         ClientSceneBus.clear();
+        PlayerBodyAttachmentCache.clear();
         VeilSceneNodeRenderer.clearLights();
         VeilSceneNodeRenderer.clearMaterialTextureCache();
         VeilWorldEnvironmentRenderer.clear();
         MoudTextures.clear();
         MoudTextAssets.clear();
+        MoudAudioAssets.clear();
         ModelCache.clear();
+        sceneAudio.clear(MinecraftClient.getInstance());
 
         camera.setEnabled(false);
         camera.resetBootstrap();
         MinecraftGhostBlocks.get().cancel();
         playRuntime.onDisconnect();
         pendingRuntimeOps.clear();
+        ClientPlayerMotionController.reset();
 
         if (overlay != null) {
             overlay.setOpen(false);
@@ -251,7 +272,7 @@ final class MoudClient {
         }
     }
 
-    private void renderOverlays() {
+    private void renderOverlays(DrawContext drawContext) {
         boolean isConnected = session != null && session.state() == SessionState.CONNECTED;
 
         if (isConnected && overlayOpen && overlay != null) {
@@ -263,7 +284,7 @@ final class MoudClient {
         }
 
         if (isConnected && playRuntime.isActive()) {
-            playRuntime.tick(session);
+            HudCanvasRenderer.render(drawContext, MinecraftClient.getInstance());
         }
     }
 
@@ -279,6 +300,8 @@ final class MoudClient {
         handleInputBlocking(client);
         handleOverlayState();
         tickSystems();
+        // anchor override, must run last
+        ClientPlayerMotionController.clientTick(client);
     }
 
     private void handleSessionLifecycle(MinecraftClient client) {
@@ -350,7 +373,7 @@ final class MoudClient {
         }
 
         if (playRuntime.isActive() && client.currentScreen == null) {
-            client.mouse.lockCursor();
+            playRuntime.applyCursorMode(client);
         }
 
         if (overlayOpen && !camera.isCapturing()) {
@@ -395,8 +418,10 @@ final class MoudClient {
         if (overlayOpen && session != null && session.state() == SessionState.CONNECTED) {
             assets.tick(session);
         }
+        sceneAudio.tick(MinecraftClient.getInstance(), playRuntime.isActive() && session != null && session.state() == SessionState.CONNECTED);
         if (playRuntime.isActive() && session != null) {
             playRuntime.tick(session);
+            uiInputTracker.tick(session, playRuntime);
         }
         if (session != null) {
             session.tick();
@@ -416,6 +441,7 @@ final class MoudClient {
         }
 
         overlayOpen = true;
+        pendingRestoreSnapshot = true;
         camera.setEnabled(true);
 
         if (client != null && client.mouse != null) {
@@ -449,6 +475,10 @@ final class MoudClient {
         }
 
         editorContext.setOverlay(overlay);
+
+        if (overlay != null) {
+            overlay.saveAllOpenEditors();
+        }
 
         if (session != null && session.state() == SessionState.CONNECTED) {
             session.send(Lane.STATE, new EditorModeChanged(false));
@@ -503,6 +533,8 @@ final class MoudClient {
 
         if (message instanceof RuntimeState state) {
             playRuntime.onRuntimeState(state);
+        } else if (message instanceof CursorState state) {
+            playRuntime.onCursorState(state);
         } else if (message instanceof ProjectInfo info && overlayReady) {
             overlay.onProjectInfo(info);
         } else if (message instanceof ProjectCreateAck ack && overlayReady) {
@@ -523,6 +555,10 @@ final class MoudClient {
             handleSceneDelete(ack, overlayReady);
         } else if (message instanceof SceneSnapshot snapshot) {
             lastSnapshot = snapshot;
+            if (pendingRestoreSnapshot) {
+                pendingRestoreSnapshot = false;
+                ClientSceneBus.markRestorePending();
+            }
             ClientSceneBus.applySnapshot(snapshot);
             if (!overlayOpen && playRuntime.isActive() && !pendingRuntimeOps.isEmpty()) {
                 ClientSceneBus.applyOps(List.copyOf(pendingRuntimeOps));
@@ -544,7 +580,12 @@ final class MoudClient {
                 return;
             }
             if (playRuntime.isActive() && !overlayOpen) {
-                ClientSceneBus.applyOps(batch.ops());
+                boolean isPhysics = (batch.batchId() & (1L << 62)) != 0L;
+                if (isPhysics) {
+                    ClientSceneBus.applyPhysicsOps(batch.ops());
+                } else {
+                    ClientSceneBus.applyOps(batch.ops());
+                }
             }
         } else if (message instanceof SchemaSnapshot schema) {
             lastSchema = schema;
@@ -561,6 +602,10 @@ final class MoudClient {
                 overlay.onAck(ack);
             }
             MinecraftGhostBlocks.get().onAck(ack);
+        } else if (message instanceof MultiMeshData mmData) {
+            InstanceDataStore.accumulate(mmData.nodeId(), mmData.offset(), mmData.total(), mmData.data());
+        } else if (message instanceof PlayerMotion motion) {
+            ClientPlayerMotionController.onPlayerMotion(motion);
         }
     }
 
